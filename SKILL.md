@@ -30,7 +30,7 @@ exa search "news" --highlights --compact       # Token-efficient excerpts
 exa search "breaking" --max-age 1 --compact    # Fresh content only (hours)
 exa find https://example.com/post --compact    # Pages similar to a URL
 exa content https://example.com --compact      # Extract page content
-exa answer "what is X" --compact               # AI answer with sources
+exa answer "what is X" --compact               # AI answer with sources (Exa /answer)
 exa research "compare X vs Y" --compact        # Deep async research
 exa research "topic" --model exa-research-pro  # Thorough research model
 exa research "list items" --schema schema.json # Structured output
@@ -66,8 +66,8 @@ exa search "AI companies" --type auto --category company --json -n 3  # Structur
 - `--after/--before <YYYY-MM-DD>` — Date filter
 - `--no-cache` — Bypass response cache
 - `--cache-ttl <min>` — Cache TTL in minutes (default: 60)
-- `--model exa-research-pro` — Thorough research model
-- `--schema <file>` — Structured research output
+- `--model <m>` — research: `exa-research-pro` (thorough); answer: `exa-pro`, `exa-fast`
+- `--schema <file>` — Structured research/answer output
 
 ## Key Management
 
@@ -80,6 +80,7 @@ exa reset     # Clear cooldowns, statistics and invalid-key flags
 
 - Round-robin across multiple keys
 - Auto-retry on 429 (up to 3 times)
+- A key rejected with 401 is skipped from then on (while another key is available); `exa reset` re-enables it
 - Respects Retry-After headers
 - Waits if all keys exhausted
 - State persists in config dir

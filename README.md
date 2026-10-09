@@ -99,8 +99,8 @@ exa search "query" --json --compact
 | `--no-cache` | Bypass response cache |
 | `--cache-ttl <min>` | Cache TTL in minutes (default: 60) |
 | `--no-sources` | Hide sources in answer/research |
-| `--model <m>` | `exa-research` (default) or `exa-research-pro` |
-| `--schema <file>` | JSON schema for structured research output |
+| `--model <m>` | research: `exa-research` (default) or `exa-research-pro`; answer: `exa` (default), `exa-pro`, `exa-fast` |
+| `--schema <file>` | JSON schema for structured research/answer output |
 
 ## Token Optimization
 

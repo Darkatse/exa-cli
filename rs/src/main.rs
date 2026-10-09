@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use key_manager::KeyManager;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -44,11 +45,11 @@ struct Cli {
     #[arg(long = "json", global = true)]
     json: bool,
 
-    /// Research model (exa-research, exa-research-pro)
-    #[arg(long = "model", global = true, default_value = "exa-research")]
-    model: String,
+    /// Model. research: exa-research (default), exa-research-pro; answer: exa (default), exa-pro, exa-fast
+    #[arg(long = "model", global = true)]
+    model: Option<String>,
 
-    /// JSON schema file for structured research output
+    /// JSON schema file for structured research/answer output
     #[arg(long = "schema", global = true)]
     schema: Option<String>,
 
@@ -200,6 +201,15 @@ struct GetContentsRequest {
 }
 
 #[derive(Serialize)]
+struct AnswerRequest {
+    query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "outputSchema", skip_serializing_if = "Option::is_none")]
+    output_schema: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
 struct ResearchCreateRequest {
     instructions: String,
     model: String,
@@ -309,6 +319,24 @@ struct CostDollars {
     total: Option<f64>,
 }
 
+#[derive(Deserialize, Serialize, Debug)]
+struct AnswerResponse {
+    /// A string, or a JSON object matching --schema
+    answer: serde_json::Value,
+    #[serde(default)]
+    citations: Vec<AnswerCitation>,
+    #[serde(rename = "costDollars")]
+    cost_dollars: Option<CostDollars>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct AnswerCitation {
+    title: Option<String>,
+    url: String,
+    #[serde(rename = "publishedDate")]
+    published_date: Option<String>,
+}
+
 struct ExaClient {
     client: reqwest::Client,
     key_manager: KeyManager,
@@ -324,24 +352,35 @@ impl ExaClient {
         }
     }
 
-    async fn search(&mut self, request: SearchRequest) -> Result<SearchResponse> {
+    /// Send the request made by `build` (given the HTTP client and base URL), rotating
+    /// keys on 429 (rate limited) and 401 (key rejected). `pinned_key` forces one key,
+    /// e.g. to poll a research task with the key that created it.
+    async fn send<T: DeserializeOwned>(
+        &mut self,
+        name: &str,
+        pinned_key: Option<usize>,
+        build: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+    ) -> Result<(T, usize)> {
         const MAX_RETRIES: usize = 3;
 
         for attempt in 0..MAX_RETRIES {
-            let (key_idx, api_key) = self.key_manager.get_next_key()?;
+            let last_attempt = attempt + 1 == MAX_RETRIES;
+            let (key_idx, api_key) = match pinned_key {
+                Some(idx) => {
+                    let key = self.key_manager.get_key_by_index(idx).context("Invalid key index")?;
+                    (idx, key)
+                }
+                None => self.key_manager.get_next_key()?,
+            };
 
-            let resp = self
-                .client
-                .post(format!("{}/search", self.base_url))
+            let resp = build(&self.client, &self.base_url)
                 .header("x-api-key", &api_key)
-                .header("Content-Type", "application/json")
-                .json(&request)
                 .send()
                 .await
-                .context("Failed to send search request")?;
+                .with_context(|| format!("Failed to send {} request", name))?;
 
             let status = resp.status();
-            let _ = self.key_manager.log_request(key_idx, "search", status.as_u16());
+            let _ = self.key_manager.log_request(key_idx, name, status.as_u16());
 
             if status.as_u16() == 429 {
                 let retry_after = resp
@@ -350,216 +389,76 @@ impl ExaClient {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<u64>().ok());
                 self.key_manager.mark_rate_limited(key_idx, retry_after);
-                if attempt < MAX_RETRIES - 1 {
+                if !last_attempt {
                     continue;
                 }
                 bail!("Rate limited after {} retries", MAX_RETRIES);
             }
 
+            // Key rejected: skip it from now on and retry with another one. The last
+            // usable key is never disabled, so a single bad key just reports the error.
+            if status.as_u16() == 401 && pinned_key.is_none() && self.key_manager.valid_key_count() > 1 {
+                self.key_manager.mark_invalid(key_idx);
+                if !last_attempt {
+                    continue;
+                }
+            }
+
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
-                bail!("Search failed ({}): {}", status, text);
+                bail!("{} request failed ({}): {}", name, status, text);
             }
 
             self.key_manager.record_success(key_idx);
-            return resp.json().await.context("Failed to parse search response");
+            let body = resp
+                .json()
+                .await
+                .with_context(|| format!("Failed to parse {} response", name))?;
+            return Ok((body, key_idx));
         }
 
-        bail!("Search failed after {} retries", MAX_RETRIES)
+        bail!("{} request failed after {} retries", name, MAX_RETRIES)
+    }
+
+    async fn search(&mut self, request: SearchRequest) -> Result<SearchResponse> {
+        let (response, _) = self
+            .send("search", None, |c, base| c.post(format!("{}/search", base)).json(&request))
+            .await?;
+        Ok(response)
     }
 
     async fn find_similar(&mut self, request: FindSimilarRequest) -> Result<SearchResponse> {
-        const MAX_RETRIES: usize = 3;
-
-        for attempt in 0..MAX_RETRIES {
-            let (key_idx, api_key) = self.key_manager.get_next_key()?;
-
-            let resp = self
-                .client
-                .post(format!("{}/findSimilar", self.base_url))
-                .header("x-api-key", &api_key)
-                .header("Content-Type", "application/json")
-                .json(&request)
-                .send()
-                .await
-                .context("Failed to send find similar request")?;
-
-            let status = resp.status();
-            let _ = self.key_manager.log_request(key_idx, "findSimilar", status.as_u16());
-
-            if status.as_u16() == 429 {
-                let retry_after = resp
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok());
-                self.key_manager.mark_rate_limited(key_idx, retry_after);
-                if attempt < MAX_RETRIES - 1 {
-                    continue;
-                }
-                bail!("Rate limited after {} retries", MAX_RETRIES);
-            }
-
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                bail!("Find similar failed ({}): {}", status, text);
-            }
-
-            self.key_manager.record_success(key_idx);
-            return resp
-                .json()
-                .await
-                .context("Failed to parse find similar response");
-        }
-
-        bail!("Find similar failed after {} retries", MAX_RETRIES)
+        let (response, _) = self
+            .send("findSimilar", None, |c, base| c.post(format!("{}/findSimilar", base)).json(&request))
+            .await?;
+        Ok(response)
     }
 
     async fn get_contents(&mut self, urls: Vec<String>) -> Result<SearchResponse> {
-        const MAX_RETRIES: usize = 3;
         let request = GetContentsRequest { urls, text: true };
+        let (response, _) = self
+            .send("contents", None, |c, base| c.post(format!("{}/contents", base)).json(&request))
+            .await?;
+        Ok(response)
+    }
 
-        for attempt in 0..MAX_RETRIES {
-            let (key_idx, api_key) = self.key_manager.get_next_key()?;
-
-            let resp = self
-                .client
-                .post(format!("{}/contents", self.base_url))
-                .header("x-api-key", &api_key)
-                .header("Content-Type", "application/json")
-                .json(&request)
-                .send()
-                .await
-                .context("Failed to send get contents request")?;
-
-            let status = resp.status();
-            let _ = self.key_manager.log_request(key_idx, "contents", status.as_u16());
-
-            if status.as_u16() == 429 {
-                let retry_after = resp
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok());
-                self.key_manager.mark_rate_limited(key_idx, retry_after);
-                if attempt < MAX_RETRIES - 1 {
-                    continue;
-                }
-                bail!("Rate limited after {} retries", MAX_RETRIES);
-            }
-
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                bail!("Get contents failed ({}): {}", status, text);
-            }
-
-            self.key_manager.record_success(key_idx);
-            return resp
-                .json()
-                .await
-                .context("Failed to parse get contents response");
-        }
-
-        bail!("Get contents failed after {} retries", MAX_RETRIES)
+    async fn answer(&mut self, request: AnswerRequest) -> Result<AnswerResponse> {
+        let (response, _) = self
+            .send("answer", None, |c, base| c.post(format!("{}/answer", base)).json(&request))
+            .await?;
+        Ok(response)
     }
 
     async fn research_create(&mut self, request: ResearchCreateRequest) -> Result<(ResearchCreateResponse, usize)> {
-        const MAX_RETRIES: usize = 3;
-
-        for attempt in 0..MAX_RETRIES {
-            let (key_idx, api_key) = self.key_manager.get_next_key()?;
-
-            let resp = self
-                .client
-                .post(format!("{}/research", self.base_url))
-                .header("x-api-key", &api_key)
-                .header("Content-Type", "application/json")
-                .json(&request)
-                .send()
-                .await
-                .context("Failed to create research task")?;
-
-            let status = resp.status();
-            let _ = self.key_manager.log_request(key_idx, "research", status.as_u16());
-
-            if status.as_u16() == 429 {
-                let retry_after = resp
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok());
-                self.key_manager.mark_rate_limited(key_idx, retry_after);
-                if attempt < MAX_RETRIES - 1 {
-                    continue;
-                }
-                bail!("Rate limited after {} retries", MAX_RETRIES);
-            }
-
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                bail!("Research create failed ({}): {}", status, text);
-            }
-
-            self.key_manager.record_success(key_idx);
-            let response: ResearchCreateResponse = resp
-                .json()
-                .await
-                .context("Failed to parse research create response")?;
-            return Ok((response, key_idx));
-        }
-
-        bail!("Research create failed after {} retries", MAX_RETRIES)
+        self.send("research", None, |c, base| c.post(format!("{}/research", base)).json(&request))
+            .await
     }
 
     async fn research_status(&mut self, research_id: &str, key_idx: Option<usize>) -> Result<ResearchStatusResponse> {
-        const MAX_RETRIES: usize = 3;
-
-        for attempt in 0..MAX_RETRIES {
-            let (idx, api_key) = if let Some(specific_idx) = key_idx {
-                let key = self.key_manager.get_key_by_index(specific_idx)
-                    .context("Invalid key index")?;
-                (specific_idx, key)
-            } else {
-                self.key_manager.get_next_key()?
-            };
-
-            let resp = self
-                .client
-                .get(format!("{}/research/{}", self.base_url, research_id))
-                .header("x-api-key", &api_key)
-                .send()
-                .await
-                .context("Failed to get research status")?;
-
-            let status = resp.status();
-            let _ = self.key_manager.log_request(idx, "research_status", status.as_u16());
-
-            if status.as_u16() == 429 {
-                let retry_after = resp
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok());
-                self.key_manager.mark_rate_limited(idx, retry_after);
-                if attempt < MAX_RETRIES - 1 {
-                    continue;
-                }
-                bail!("Rate limited after {} retries", MAX_RETRIES);
-            }
-
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                bail!("Research status failed ({}): {}", status, text);
-            }
-
-            self.key_manager.record_success(idx);
-            return resp
-                .json()
-                .await
-                .context("Failed to parse research status response");
-        }
-
-        bail!("Research status failed after {} retries", MAX_RETRIES)
+        let (response, _) = self
+            .send("research_status", key_idx, |c, base| c.get(format!("{}/research/{}", base, research_id)))
+            .await?;
+        Ok(response)
     }
 }
 
@@ -1026,76 +925,63 @@ fn print_content_result(cli: &Cli, r: &SearchResult) -> Result<()> {
     Ok(())
 }
 
+/// Load the --schema JSON file, if given
+fn read_schema(cli: &Cli) -> Result<Option<serde_json::Value>> {
+    let Some(schema_path) = &cli.schema else {
+        return Ok(None);
+    };
+    let schema_content = fs::read_to_string(schema_path).context("Failed to read schema file")?;
+    Ok(Some(serde_json::from_str(&schema_content).context("Failed to parse schema JSON")?))
+}
+
 async fn cmd_answer(client: &mut ExaClient, cli: &Cli, query: String) -> Result<()> {
-    let request = SearchRequest {
+    let request = AnswerRequest {
         query,
-        num_results: 5,
-        contents: Some(ContentsConfig {
-            text: Some(true),
-            highlights: Some(HighlightsConfig { max_characters: 2000 }),
-            verbosity: cli.verbosity.clone(),
-        }),
-        include_domains: None,
-        start_published_date: None,
-        end_published_date: None,
-        search_type: Some(cli.search_type.clone()),
-        category: None,
-        max_age_hours: None,
+        model: cli.model.clone(),
+        output_schema: read_schema(cli)?,
     };
 
-    let results = client.search(request).await?;
+    let result = client.answer(request).await?;
 
     if cli.json {
-        println!("{}", to_json(&results, cli.compact)?);
+        println!("{}", to_json(&result, cli.compact)?);
         return Ok(());
     }
 
-    if results.results.is_empty() {
-        eprintln!("No results found.");
-        std::process::exit(3);
-    }
+    // A plain answer is a string; with --schema it is a JSON object
+    let answer = match &result.answer {
+        serde_json::Value::String(text) => text.clone(),
+        other => to_json(other, cli.compact)?,
+    };
 
-    let max_chars = get_max_chars(cli);
-
-    // Compile highlights as "answer"
-    let highlights: Vec<&str> = results
-        .results
-        .iter()
-        .filter_map(|r| r.highlights.as_ref())
-        .flatten()
-        .take(3)
-        .map(|s| s.as_str())
-        .collect();
-
+    // Sources are numbered and complete so the answer's [n] markers can be resolved
     if cli.compact {
-        if !highlights.is_empty() {
-            for h in &highlights {
-                println!("{}", h);
-            }
-        } else if let Some(text) = &results.results[0].text {
-            println!("{}", truncate_text(text, max_chars));
-        }
-        if !cli.no_sources {
-            println!("sources: {}", results.results.iter().take(3).map(|r| r.url.as_str()).collect::<Vec<_>>().join(" | "));
+        println!("{}", answer);
+        if !cli.no_sources && !result.citations.is_empty() {
+            let sources: Vec<String> = result
+                .citations
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("[{}] {}", i + 1, c.url))
+                .collect();
+            println!("sources: {}", sources.join(" | "));
         }
     } else {
         println!("{}", "Answer:".bold().green());
+        if let Some(total) = result.cost_dollars.as_ref().and_then(|c| c.total) {
+            println!("{}", format!("Cost: ${:.4}", total).dimmed());
+        }
+        println!();
+        println!("{}", answer);
         println!();
 
-        if !highlights.is_empty() {
-            for h in &highlights {
-                println!("  {}", h);
-            }
-            println!();
-        } else if let Some(text) = &results.results[0].text {
-            println!("{}", truncate_text(text, max_chars));
-            println!();
-        }
-
-        if !cli.no_sources {
+        if !cli.no_sources && !result.citations.is_empty() {
             println!("{}", "Sources:".dimmed());
-            for r in results.results.iter().take(3) {
-                println!("  {}", r.url.cyan());
+            for (i, cite) in result.citations.iter().enumerate() {
+                match cite.title.as_deref() {
+                    Some(title) if !title.is_empty() => println!("  [{}] {} {}", i + 1, title, cite.url.cyan()),
+                    _ => println!("  [{}] {}", i + 1, cite.url.cyan()),
+                }
             }
         }
     }
@@ -1104,16 +990,9 @@ async fn cmd_answer(client: &mut ExaClient, cli: &Cli, query: String) -> Result<
 }
 
 async fn cmd_research(client: &mut ExaClient, cli: &Cli, query: String) -> Result<()> {
-    // Load schema if provided
-    let output_schema = if let Some(schema_path) = &cli.schema {
-        let schema_content =
-            fs::read_to_string(schema_path).context("Failed to read schema file")?;
-        Some(serde_json::from_str(&schema_content).context("Failed to parse schema JSON")?)
-    } else {
-        None
-    };
+    let output_schema = read_schema(cli)?;
 
-    let model = if cli.model == "exa-research-pro" {
+    let model = if cli.model.as_deref() == Some("exa-research-pro") {
         "exa-research-pro"
     } else {
         "exa-research"
@@ -1257,10 +1136,6 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
-    // Validate keys if state is stale
-    let http_client = reqwest::Client::new();
-    key_manager.validate_keys_if_stale(&http_client).await?;
-
     let mut client = ExaClient::new(key_manager);
 
     let result = match &cli.command {
@@ -1328,5 +1203,25 @@ mod tests {
     fn test_truncate_text_does_not_split_multibyte_chars() {
         let text = format!("{}’s a sentence.", "x".repeat(299));
         assert_eq!(truncate_text(&text, 300), format!("{}’...", "x".repeat(299)));
+    }
+
+    #[test]
+    fn test_answer_request_omits_unset_fields() {
+        let request = AnswerRequest { query: "q".to_string(), model: None, output_schema: None };
+        assert_eq!(serde_json::to_string(&request).unwrap(), r#"{"query":"q"}"#);
+    }
+
+    #[test]
+    fn test_answer_response_parses_text_and_structured_answers() {
+        let text: AnswerResponse = serde_json::from_str(
+            r#"{"requestId":"r","answer":"42","citations":[{"id":"1","title":"T","url":"https://a.example","publishedDate":"2025-01-01"}],"costDollars":{"total":0.005}}"#,
+        )
+        .unwrap();
+        assert_eq!(text.answer, serde_json::json!("42"));
+        assert_eq!(text.citations[0].url, "https://a.example");
+
+        let structured: AnswerResponse = serde_json::from_str(r#"{"answer":{"name":"x"}}"#).unwrap();
+        assert!(structured.answer.is_object());
+        assert!(structured.citations.is_empty());
     }
 }

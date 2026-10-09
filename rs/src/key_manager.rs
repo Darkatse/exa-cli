@@ -9,7 +9,6 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 const DEFAULT_COOLDOWN_SECS: i64 = 60;
-const STALE_THRESHOLD_HOURS: i64 = 24;
 const MAX_LOG_SIZE: u64 = 5 * 1024 * 1024; // 5MB
 
 /// Masks an API key, showing only the last 3 characters
@@ -55,7 +54,6 @@ impl Default for KeyInfo {
 pub struct KeyState {
     pub version: u32,
     pub current_index: usize,
-    pub last_validated: DateTime<Utc>,
     pub keys: HashMap<usize, KeyInfo>,
 }
 
@@ -64,7 +62,6 @@ impl Default for KeyState {
         Self {
             version: 1,
             current_index: 0,
-            last_validated: Utc::now(),
             keys: HashMap::new(),
         }
     }
@@ -190,10 +187,11 @@ impl KeyManager {
         Ok(())
     }
 
-    /// Check if state is stale (older than 24 hours)
-    pub fn is_state_stale(&self) -> bool {
-        let threshold = Utc::now() - Duration::hours(STALE_THRESHOLD_HOURS);
-        self.state.last_validated < threshold
+    /// Number of keys not marked invalid
+    pub fn valid_key_count(&self) -> usize {
+        (0..self.keys.len())
+            .filter(|i| self.state.keys.get(i).map_or(true, |info| info.valid))
+            .count()
     }
 
     /// Get the next available key (cooldown-aware)
@@ -368,73 +366,6 @@ impl KeyManager {
         Ok(())
     }
 
-    /// Validate all keys if state is stale
-    pub async fn validate_keys_if_stale(&mut self, client: &reqwest::Client) -> Result<()> {
-        if !self.is_state_stale() {
-            return Ok(());
-        }
-
-        if self.verbose {
-            eprintln!("Validating API keys (state is stale)...");
-        }
-
-        let mut invalid_indices = Vec::new();
-        let mut valid_indices = Vec::new();
-
-        for (idx, key) in self.keys.iter().enumerate() {
-            let resp = client
-                .post("https://api.exa.ai/search")
-                .header("x-api-key", key)
-                .header("Content-Type", "application/json")
-                .json(&serde_json::json!({
-                    "query": "test",
-                    "numResults": 1
-                }))
-                .send()
-                .await;
-
-            match resp {
-                Ok(r) => {
-                    let status = r.status();
-                    if status.as_u16() == 401 || status.as_u16() == 403 {
-                        invalid_indices.push(idx);
-                    } else {
-                        // The key authenticated, so re-enable it if an earlier check disabled it
-                        if status.is_success() || status.as_u16() == 429 {
-                            valid_indices.push(idx);
-                        }
-                        if self.verbose {
-                            eprintln!("Key {} is valid", mask_key(key));
-                        }
-                    }
-                }
-                Err(e) => {
-                    if self.verbose {
-                        eprintln!(
-                            "{} Failed to validate key {}: {}",
-                            "Warning:".yellow(),
-                            mask_key(key),
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        // Update key validity after the iteration
-        for idx in invalid_indices {
-            self.mark_invalid(idx);
-        }
-        for idx in valid_indices {
-            self.state.keys.entry(idx).or_insert_with(KeyInfo::default).valid = true;
-        }
-
-        self.state.last_validated = Utc::now();
-        self.save_state()?;
-
-        Ok(())
-    }
-
     /// Reset all cooldowns, usage statistics and invalid-key flags
     pub fn reset(&mut self) -> Result<()> {
         for info in self.state.keys.values_mut() {
@@ -463,16 +394,6 @@ impl KeyManager {
             "{}: {}",
             "Next Key Index".bold(),
             self.state.current_index % self.keys.len()
-        );
-        println!(
-            "{}: {}",
-            "Last Validated".bold(),
-            self.state.last_validated.format("%Y-%m-%d %H:%M:%S UTC")
-        );
-        println!(
-            "{}: {}",
-            "State Stale".bold(),
-            if self.is_state_stale() { "Yes" } else { "No" }
         );
         println!();
 
