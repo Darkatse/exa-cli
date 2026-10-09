@@ -7,19 +7,21 @@ Built for speed. Optimized for AI agents — `--compact` mode strips all decorat
 ## Install
 
 ```bash
-cargo install exa-cli
+cargo install --git https://github.com/Darkatse/exa-cli exa-cli
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/Finesssee/exa-cli
+git clone https://github.com/Darkatse/exa-cli
 cd exa-cli/rs
 cargo build --release
 # Binary at ./target/release/exa
 ```
 
-> **Note:** The Node.js version (`npm install -g exa-cli`) is deprecated. Use the Rust version above.
+> **Note:** `exa-cli` is not published on crates.io, and the `exa-cli` package on npm is an unrelated project. Install from this repository as shown above.
+
+Forked from [Finesssee/exa-cli](https://github.com/Finesssee/exa-cli).
 
 ## Setup
 

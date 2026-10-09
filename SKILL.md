@@ -28,7 +28,7 @@ exa search "query" --type deep --compact       # Comprehensive research
 exa search "AI startups" --category company    # Category-filtered search
 exa search "news" --highlights --compact       # Token-efficient excerpts
 exa search "breaking" --max-age 1 --compact    # Fresh content only (hours)
-exa find "similar to this" --compact           # Semantic similarity
+exa find https://example.com/post --compact    # Pages similar to a URL
 exa content https://example.com --compact      # Extract page content
 exa answer "what is X" --compact               # AI answer with sources
 exa research "compare X vs Y" --compact        # Deep async research
@@ -73,7 +73,7 @@ exa search "AI companies" --type auto --category company --json -n 3  # Structur
 
 ```bash
 exa status    # Show keys, cooldowns, usage stats
-exa reset     # Clear cooldowns and statistics
+exa reset     # Clear cooldowns, statistics and invalid-key flags
 ```
 
 ## Key Rotation
