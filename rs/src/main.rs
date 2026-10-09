@@ -114,7 +114,7 @@ enum Commands {
     },
     /// Semantic similarity search
     Find {
-        /// Query or URL for similarity search
+        /// URL to find similar pages for
         query: Vec<String>,
     },
     /// Extract content from URL
@@ -136,7 +136,7 @@ enum Commands {
     /// Show API key status, cooldowns, and usage
     Status,
 
-    /// Reset cooldowns and usage statistics
+    /// Reset cooldowns, usage statistics and invalid-key flags
     Reset,
 }
 
@@ -568,20 +568,26 @@ fn get_max_chars(cli: &Cli) -> usize {
     cli.max_chars.unwrap_or(if cli.compact { 300 } else { 500 })
 }
 
+/// Byte offset just past the first `max_chars` characters, or None if the text
+/// is not longer than that. Slicing at this offset never splits a UTF-8 char.
+fn char_limit(text: &str, max_chars: usize) -> Option<usize> {
+    text.char_indices().nth(max_chars).map(|(i, _)| i)
+}
+
 /// Truncate text at the last sentence boundary within max_chars.
 /// Falls back to last word boundary, then hard cut.
 fn truncate_text(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+    let Some(end) = char_limit(text, max_chars) else {
         return text.to_string();
-    }
-    let window = &text[..max_chars];
+    };
+    let window = &text[..end];
     // Find last sentence-ending punctuation followed by space or at end
     let cut = window.rfind(". ")
         .or_else(|| window.rfind("? "))
         .or_else(|| window.rfind("! "))
         .map(|i| i + 1)  // include the punctuation
         .or_else(|| window.rfind(' '))  // fallback: last word boundary
-        .unwrap_or(max_chars);          // fallback: hard cut
+        .unwrap_or(end);                // fallback: hard cut
     format!("{}...", text[..cut].trim_end())
 }
 
@@ -649,10 +655,9 @@ fn print_entity(entity: &Entity, compact: bool) {
 
     if compact {
         if let Some(desc) = &props.description {
-            let short = if desc.len() > 200 {
-                format!("{}...", desc[..200].trim_end())
-            } else {
-                desc.clone()
+            let short = match char_limit(desc, 200) {
+                Some(end) => format!("{}...", desc[..end].trim_end()),
+                None => desc.clone(),
             };
             println!("about: {}", short);
         }
@@ -748,6 +753,11 @@ fn cache_key(parts: &[&str]) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// Whether the local response cache applies (`--max-age 0` asks for live results)
+fn use_cache(cli: &Cli) -> bool {
+    !cli.no_cache && cli.max_age != Some(0)
+}
+
 /// Read from cache if fresh (returns None if miss/stale)
 fn cache_read(key: &str, ttl_minutes: u64) -> Option<String> {
     let path = cache_dir().ok()?.join(format!("{}.json", key));
@@ -785,22 +795,6 @@ fn cache_write(key: &str, data: &str) {
 }
 
 async fn cmd_search(client: &mut ExaClient, cli: &Cli, query: String) -> Result<()> {
-    let max_age_str = cli.max_age.map(|v| v.to_string()).unwrap_or_default();
-    let highlights_str = cli.highlights.map(|v| v.to_string()).unwrap_or_default();
-    let ckey = cache_key(&["search", &query, &cli.num.to_string(),
-        cli.domain.as_deref().unwrap_or(""), cli.after.as_deref().unwrap_or(""),
-        cli.before.as_deref().unwrap_or(""), &cli.search_type,
-        cli.category.as_deref().unwrap_or(""), &max_age_str, &highlights_str]);
-
-    // Check cache
-    if !cli.no_cache {
-        if let Some(cached) = cache_read(&ckey, cli.cache_ttl) {
-            if let Ok(results) = serde_json::from_str::<SearchResponse>(&cached) {
-                return print_search_results(cli, &results);
-            }
-        }
-    }
-
     let request = SearchRequest {
         query,
         num_results: cli.num,
@@ -812,11 +806,22 @@ async fn cmd_search(client: &mut ExaClient, cli: &Cli, query: String) -> Result<
         category: cli.category.clone(),
         max_age_hours: cli.max_age,
     };
+    let ckey = cache_key(&["search", &serde_json::to_string(&request)?]);
+    let use_cache = use_cache(cli);
+
+    // Check cache
+    if use_cache {
+        if let Some(cached) = cache_read(&ckey, cli.cache_ttl) {
+            if let Ok(results) = serde_json::from_str::<SearchResponse>(&cached) {
+                return print_search_results(cli, &results);
+            }
+        }
+    }
 
     let results = client.search(request).await?;
 
     // Write to cache
-    if !cli.no_cache {
+    if use_cache {
         if let Ok(data) = serde_json::to_string(&results) {
             cache_write(&ckey, &data);
         }
@@ -918,16 +923,6 @@ fn print_search_results(cli: &Cli, results: &SearchResponse) -> Result<()> {
 }
 
 async fn cmd_find(client: &mut ExaClient, cli: &Cli, query: String) -> Result<()> {
-    let ckey = cache_key(&["find", &query, &cli.num.to_string(), &cli.search_type]);
-
-    if !cli.no_cache {
-        if let Some(cached) = cache_read(&ckey, cli.cache_ttl) {
-            if let Ok(results) = serde_json::from_str::<SearchResponse>(&cached) {
-                return print_search_results(cli, &results);
-            }
-        }
-    }
-
     let request = FindSimilarRequest {
         url: query,
         num_results: cli.num,
@@ -936,10 +931,20 @@ async fn cmd_find(client: &mut ExaClient, cli: &Cli, query: String) -> Result<()
         category: cli.category.clone(),
         max_age_hours: cli.max_age,
     };
+    let ckey = cache_key(&["find", &serde_json::to_string(&request)?]);
+    let use_cache = use_cache(cli);
+
+    if use_cache {
+        if let Some(cached) = cache_read(&ckey, cli.cache_ttl) {
+            if let Ok(results) = serde_json::from_str::<SearchResponse>(&cached) {
+                return print_search_results(cli, &results);
+            }
+        }
+    }
 
     let results = client.find_similar(request).await?;
 
-    if !cli.no_cache {
+    if use_cache {
         if let Ok(data) = serde_json::to_string(&results) {
             cache_write(&ckey, &data);
         }
@@ -950,24 +955,29 @@ async fn cmd_find(client: &mut ExaClient, cli: &Cli, query: String) -> Result<()
 
 async fn cmd_content(client: &mut ExaClient, cli: &Cli, url: String) -> Result<()> {
     let ckey = cache_key(&["content", &url]);
+    let use_cache = use_cache(cli);
 
-    if !cli.no_cache {
-        if let Some(cached) = cache_read(&ckey, cli.cache_ttl) {
-            if let Ok(results) = serde_json::from_str::<SearchResponse>(&cached) {
-                if let Some(r) = results.results.first() {
-                    return print_content_result(cli, r);
+    let cached = if use_cache {
+        cache_read(&ckey, cli.cache_ttl)
+            .and_then(|c| serde_json::from_str::<SearchResponse>(&c).ok())
+            .filter(|r| !r.results.is_empty())
+    } else {
+        None
+    };
+
+    // Cached and fresh results share the output path below, so --json works for both
+    let results = match cached {
+        Some(results) => results,
+        None => {
+            let results = client.get_contents(vec![url]).await?;
+            if use_cache {
+                if let Ok(data) = serde_json::to_string(&results) {
+                    cache_write(&ckey, &data);
                 }
             }
+            results
         }
-    }
-
-    let results = client.get_contents(vec![url]).await?;
-
-    if !cli.no_cache {
-        if let Ok(data) = serde_json::to_string(&results) {
-            cache_write(&ckey, &data);
-        }
-    }
+    };
 
     if cli.json {
         println!("{}", to_json(&results, cli.compact)?);
@@ -1241,7 +1251,7 @@ async fn main() -> Result<()> {
         }
         Commands::Reset => {
             key_manager.reset()?;
-            println!("Cooldowns and usage statistics have been reset.");
+            println!("Cooldowns, usage statistics and invalid-key flags have been reset.");
             return Ok(());
         }
         _ => {}
@@ -1295,4 +1305,28 @@ async fn main() -> Result<()> {
     client.key_manager.save_state()?;
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_text_short_text_unchanged() {
+        assert_eq!(truncate_text("short", 10), "short");
+        assert_eq!(truncate_text("中文", 2), "中文");
+    }
+
+    #[test]
+    fn test_truncate_text_counts_chars_not_bytes() {
+        let text = format!("A{}", "中文网页内容".repeat(100));
+        let out = truncate_text(&text, 300);
+        assert_eq!(out.chars().count(), 300 + "...".len());
+    }
+
+    #[test]
+    fn test_truncate_text_does_not_split_multibyte_chars() {
+        let text = format!("{}’s a sentence.", "x".repeat(299));
+        assert_eq!(truncate_text(&text, 300), format!("{}’...", "x".repeat(299)));
+    }
 }

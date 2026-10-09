@@ -14,10 +14,9 @@ const MAX_LOG_SIZE: u64 = 5 * 1024 * 1024; // 5MB
 
 /// Masks an API key, showing only the last 3 characters
 pub fn mask_key(key: &str) -> String {
-    if key.len() <= 3 {
-        "***".to_string()
-    } else {
-        format!("...{}", &key[key.len() - 3..])
+    match key.char_indices().rev().nth(2) {
+        Some((i, _)) if i > 0 => format!("...{}", &key[i..]),
+        _ => "***".to_string(),
     }
 }
 
@@ -208,7 +207,7 @@ impl KeyManager {
             .collect();
 
         if valid_indices.is_empty() {
-            bail!("No valid API keys available");
+            bail!("No valid API keys available. If you have fixed your keys, run `exa reset`.");
         }
 
         // Find keys not on cooldown
@@ -380,6 +379,7 @@ impl KeyManager {
         }
 
         let mut invalid_indices = Vec::new();
+        let mut valid_indices = Vec::new();
 
         for (idx, key) in self.keys.iter().enumerate() {
             let resp = client
@@ -398,8 +398,14 @@ impl KeyManager {
                     let status = r.status();
                     if status.as_u16() == 401 || status.as_u16() == 403 {
                         invalid_indices.push(idx);
-                    } else if self.verbose {
-                        eprintln!("Key {} is valid", mask_key(key));
+                    } else {
+                        // The key authenticated, so re-enable it if an earlier check disabled it
+                        if status.is_success() || status.as_u16() == 429 {
+                            valid_indices.push(idx);
+                        }
+                        if self.verbose {
+                            eprintln!("Key {} is valid", mask_key(key));
+                        }
                     }
                 }
                 Err(e) => {
@@ -415,9 +421,12 @@ impl KeyManager {
             }
         }
 
-        // Mark invalid keys after the iteration
+        // Update key validity after the iteration
         for idx in invalid_indices {
             self.mark_invalid(idx);
+        }
+        for idx in valid_indices {
+            self.state.keys.entry(idx).or_insert_with(KeyInfo::default).valid = true;
         }
 
         self.state.last_validated = Utc::now();
@@ -426,17 +435,18 @@ impl KeyManager {
         Ok(())
     }
 
-    /// Reset all cooldowns and usage statistics
+    /// Reset all cooldowns, usage statistics and invalid-key flags
     pub fn reset(&mut self) -> Result<()> {
         for info in self.state.keys.values_mut() {
             info.cooldown_until = None;
+            info.valid = true;
             info.usage = UsageStats::default();
         }
         self.state.current_index = 0;
         self.save_state()?;
 
         if self.verbose {
-            eprintln!("Reset all cooldowns and usage statistics");
+            eprintln!("Reset all cooldowns, usage statistics and invalid-key flags");
         }
 
         Ok(())
@@ -529,5 +539,31 @@ mod tests {
         assert_eq!(mask_key("ab"), "***");
         assert_eq!(mask_key(""), "***");
         assert_eq!(mask_key("abcdefghijklmnop"), "...nop");
+    }
+
+    #[test]
+    fn test_mask_key_non_ascii() {
+        assert_eq!(mask_key("abcdef”"), "...ef”");
+        assert_eq!(mask_key("ab”"), "***");
+    }
+
+    #[test]
+    fn test_reset_reenables_invalid_keys() {
+        let dir = std::env::temp_dir().join(format!("exa-cli-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut manager = KeyManager {
+            keys: vec!["key-one".to_string()],
+            state: KeyState::default(),
+            config_dir: dir.clone(),
+            verbose: false,
+            log_enabled: false,
+        };
+        manager.state.keys.insert(0, KeyInfo { valid: false, ..KeyInfo::default() });
+
+        assert!(manager.get_next_key().is_err());
+        manager.reset().unwrap();
+        assert_eq!(manager.get_next_key().unwrap().0, 0);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
